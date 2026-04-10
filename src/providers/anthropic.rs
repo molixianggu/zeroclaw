@@ -14,6 +14,8 @@ pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
     max_tokens: u32,
+    /// If set, enable extended thinking with the given budget (in tokens).
+    thinking_budget: Option<u32>,
 }
 
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
@@ -61,6 +63,15 @@ struct NativeChatRequest<'a> {
     tool_choice: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<ThinkingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ThinkingConfig {
+    #[serde(rename = "type")]
+    kind: String,
+    budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,12 +206,19 @@ impl AnthropicProvider {
                 .map(ToString::to_string),
             base_url,
             max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            thinking_budget: None,
         }
     }
 
     /// Override the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Enable extended thinking with the given budget (in tokens).
+    pub fn with_thinking(mut self, budget_tokens: u32) -> Self {
+        self.thinking_budget = Some(budget_tokens);
         self
     }
 
@@ -665,6 +683,22 @@ impl AnthropicProvider {
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
                         match delta_type {
+                            "thinking_delta" => {
+                                if let Some(thinking) =
+                                    delta.get("thinking").and_then(|t| t.as_str())
+                                {
+                                    if !thinking.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(
+                                                StreamChunk::reasoning(thinking.to_string()),
+                                            )))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
                             "text_delta" => {
                                 if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                                     if !text.is_empty()
@@ -787,6 +821,7 @@ impl Provider for AnthropicProvider {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let mut request = self
@@ -849,6 +884,12 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
+        let thinking = self.thinking_budget.map(|budget| ThinkingConfig {
+            kind: "enabled".to_string(),
+            budget_tokens: budget,
+        });
+        let temperature = if thinking.is_some() { 1.0 } else { temperature };
+
         tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -859,6 +900,7 @@ impl Provider for AnthropicProvider {
             tools: native_tools,
             tool_choice,
             stream: None,
+            thinking,
         };
 
         let req = self
@@ -1003,7 +1045,14 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
-        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
+        let thinking = self.thinking_budget.map(|budget| ThinkingConfig {
+            kind: "enabled".to_string(),
+            budget_tokens: budget,
+        });
+        // Anthropic requires temperature=1 when thinking is enabled.
+        let temperature = if thinking.is_some() { 1.0 } else { temperature };
+
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, ?thinking, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
@@ -1013,6 +1062,7 @@ impl Provider for AnthropicProvider {
             tools: native_tools,
             tool_choice,
             stream: Some(true),
+            thinking,
         };
 
         let body = Self::build_streaming_request(&native_request);
@@ -1670,6 +1720,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: None,
+            thinking: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -1763,6 +1814,7 @@ mod tests {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
             max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+            thinking_budget: None,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
